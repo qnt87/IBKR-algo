@@ -1,0 +1,2077 @@
+import sys
+import os
+import json
+import math
+import time
+import datetime
+import threading
+from statistics import NormalDist
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
+from ibapi.contract import Contract, ComboLeg
+from ibapi.order import Order
+from ibapi.execution import ExecutionFilter
+
+# =====================================================================================
+#  BUY-WRITE BASKET ENGINE  --  "SAFE" VERSION
+#
+#  Everything marked [FIX-n] was added to stop the engine from ever ending up SHORT
+#  stock (borrowed shares) again, and to stop short-sale proceeds from being treated
+#  as spendable cash.
+#
+#   [FIX-1] ONE gate for every stock SELL (safe_sell_shares): never sells more than the
+#           broker's last completed snapshot shows, never while another share order for
+#           that symbol is working, never off a snapshot older than the last share order.
+#   [FIX-2] Warnings (e.g. 10349 "TIF set to DAY") no longer wipe order-tracking state;
+#           only real failures do. This was making the orphan sweep sell twice.
+#   [FIX-3] openOrder ignores callbacks for orders that already finished.
+#   [FIX-4] Solvency close is throttled (it used to fire EVERY SECOND) and is now driven
+#           by EXCESS LIQUIDITY, not raw cash. Negative cash alone is no longer a breach.
+#   [FIX-5] Any SHORT stock position in a tracked symbol is detected and bought back.
+#   [FIX-6] Spendable cash excludes short-sale proceeds and is capped by excess liquidity.
+#           New trades are blocked entirely while any short stock exists.
+#   [FIX-7] No new buy-write on a symbol while a share/combo order is working, or while
+#           the broker still shows shares of it.
+#   [FIX-8] Bare-share recycling never sells shares that back a short call at the broker.
+#   [FIX-9] reqIds start high so a market-data error can never be mistaken for an order.
+#   [FIX-10] Hard cap on total long stock exposure vs Net Liquidation (no margin borrowing).
+#   [FIX-11] Shares are never sold while their covering call's buy-to-close is still
+#            working, closing the naked-call window between "call closed" and "shares sold".
+#   [FIX-12] Solvency-close cooldown raised to comfortably outlast the ~3min account-summary
+#            refresh cycle, so one stale ExcessLiquidity reading can't trigger repeat closes.
+#   [FIX-13] Bare-share auto-liquidation is restricted to symbols in CANDIDATE_UNIVERSE, so
+#            the bot never sells an unrelated existing holding it doesn't understand.
+#   [FIX-14] Unfilled NEW-position orders (buy-write combos, sell-to-open calls) are
+#            cancelled at end-of-day shutdown so nothing carries a stale limit price into
+#            the next session. Orders resolving EXISTING risk (buy-to-close, share
+#            liquidation, short-cover) are deliberately left running, never interrupted.
+#   [FIX-15] Exit logic was judging a covered call purely on the OPTION's price: a falling
+#            stock makes its short call cheap (misread as "profit capture") and a rising
+#            stock makes it expensive (misread as "stop loss") — the option and the stock
+#            leg can point in opposite directions and only the option was ever checked.
+#            monitor_exit_targets/monitor_leg_exit_targets now compute the COMBINED
+#            (stock + call) P&L before acting: it gates whether a "profit capture" is
+#            really a win, whether a "stop loss" is really a loss (and skips the forced
+#            buy-to-close if the stock rallied enough that the position is net positive),
+#            and adds a real combined stop-loss that fires on total loss regardless of what
+#            the option price alone says.
+# =====================================================================================
+
+
+# 🧮 PURE PYTHON BLACK-SCHOLES MATH
+def pure_python_norm_cdf(x):
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+def calculate_black_scholes_value(stock_price, strike, days_to_expiry, risk_free_rate, volatility):
+    if stock_price <= 0 or strike <= 0 or days_to_expiry <= 0 or volatility <= 0:
+        return 0.0
+    T = days_to_expiry / 365.0
+    d1 = (math.log(stock_price / strike) + (risk_free_rate + 0.5 * volatility ** 2) * T) / (volatility * math.sqrt(T))
+    d2 = d1 - volatility * math.sqrt(T)
+    call_price = stock_price * pure_python_norm_cdf(d1) - strike * math.exp(-risk_free_rate * T) * pure_python_norm_cdf(d2)
+    return round(call_price, 2)
+
+
+def solve_strike_for_target_delta(stock_price, days_to_expiry, risk_free_rate, volatility, target_delta):
+    """Analytically solves for the call strike whose Black-Scholes delta
+    (~= N(d1)) equals target_delta, given today's live stock price and
+    implied vol."""
+    if stock_price <= 0 or days_to_expiry <= 0 or volatility <= 0:
+        return None
+    if not (0.0 < target_delta < 1.0):
+        return None
+    T = days_to_expiry / 365.0
+    try:
+        d1 = NormalDist().inv_cdf(target_delta)
+    except (ValueError, ZeroDivisionError):
+        return None
+    try:
+        strike = stock_price / math.exp(d1 * volatility * math.sqrt(T) - (risk_free_rate + 0.5 * volatility ** 2) * T)
+    except (OverflowError, ValueError):
+        return None
+    return strike if strike > 0 else None
+
+
+BID_TICKS = {1, 66}
+ASK_TICKS = {2, 67}
+CLOSE_TICKS = {9, 75}
+
+USER_HOME = os.path.expanduser("~")
+TRADE_LOG_PATH = os.path.join(USER_HOME, "trade_log.txt")
+SESSION_HISTORY_PATH = os.path.join(USER_HOME, "engine_session_history.json")
+ENTRY_DTE_LEDGER_PATH = os.path.join(USER_HOME, "entry_dte_ledger.json")
+
+TARGET_DTE_DAYS = 30
+MIN_SHARES_FOR_COVER = 100
+FALLBACK_VOL = 0.22
+TARGET_DELTA = 0.25
+DTE_BACKSTOP_PCT = 0.20
+STANDALONE_COVERED_CALL_PERMISSION_GRANTED = False
+MIN_CASH_BUFFER = 0.0
+PROFIT_CAPTURE_PCT = 0.80
+
+# ---- [FIX] safety settings -----------------------------------------------------------
+SNAPSHOT_SETTLE_SECONDS = 5        # a position snapshot must START this long after the last share order
+SNAPSHOT_TIMEOUT_SECONDS = 30      # a snapshot with no positionEnd after this long is considered lost
+AUTO_COVER_SHORT_SHARES = True     # buy back any SHORT stock in a tracked symbol
+BLOCK_NEW_TRADES_WHILE_SHORT = True
+EXCESS_LIQ_SOFT_PCT = 0.10         # excess liquidity below 10% of net liq  -> stop opening new trades
+EXCESS_LIQ_HARD_PCT = 0.02         # excess liquidity below 2% of net liq   -> start closing positions
+# [FIX-12] Account summary (the source of ExcessLiquidity) typically refreshes every ~3 minutes.
+# A cooldown shorter than that lets the solvency-close logic act on the same stale reading twice.
+SOLVENCY_CLOSE_COOLDOWN_SECONDS = 300
+TERMINAL_ORDER_STATUSES = ("Filled", "Cancelled", "ApiCancelled", "Inactive")
+
+# [FIX-10] Hard ceiling on total long stock value vs Net Liquidation. 1.0 = never rely on margin.
+MAX_LONG_EXPOSURE_PCT = 1.0
+
+# [FIX-15] Real combined (stock + call) loss, as a % of the stock cost basis, that forces a
+# close regardless of what the option price alone says. This is the backstop for the exact
+# case in the bug report: a call that's still cheap/short-DTE while its stock is cratering.
+COMBINED_STOP_LOSS_PCT = 0.15
+
+CANDIDATE_UNIVERSE = {
+    "mag7": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA"],
+}
+ALL_UNIVERSE_SYMBOLS = {s for syms in CANDIDATE_UNIVERSE.values() for s in syms}
+
+
+class OptionLeg:
+    def __init__(self, contract, quantity, entry_credit, entry_days_to_expiry=0.0):
+        self.contract = contract
+        self.position_quantity = quantity
+        self.entry_credit = entry_credit
+        self.take_profit_target = 0.0
+        self.stop_loss_target = 0.0
+        self.entry_days_to_expiry = entry_days_to_expiry
+        self.live_option_bid = 0.0
+        self.live_option_ask = 0.0
+        self.data_reqid = None
+        self.position_active = True
+
+
+class SymbolState:
+    def __init__(self, symbol, category="existing_holding", is_existing_holding=True):
+        self.symbol = symbol
+        self.category = category
+        self.is_existing_holding = is_existing_holding
+        self.shares_owned = 0
+        self.stock_conid = None
+        self.target_option = None
+        self.chain_contracts = []
+        self.contract_resolved = False
+        self.has_executed = False
+        self.live_stock_price = 0.0
+        self.live_option_bid = 0.0
+        self.live_option_ask = 0.0
+        self.implied_vol = 0.0
+        self.days_to_expiry = 8.0
+        self.entry_days_to_expiry = 0.0
+        self.position_active = False
+        self.entry_credit = 0.0
+        self.position_quantity = 0
+        self.take_profit_target = 0.0
+        self.stop_loss_target = 0.0
+        self.data_reqid = None
+        self.chain_reqid = None
+        self.stock_conid_reqid = None
+        self.bs_edge = 0.0
+        self.annualized_yield = 0.0
+        self.opened_by_bot = False
+        self.permission_warned = False
+        self.other_option_legs = []
+        self.avg_stock_cost = 0.0   # [FIX-15] per-share cost basis, needed for combined P&L
+
+
+class BuyWriteBasketEngine(EWrapper, EClient):
+    def __init__(self):
+        EClient.__init__(self, self)
+        self.next_order_id = None
+        self.heartbeat_count = 0
+        self.symbol_states = {}
+        self.reqid_to_symbol = {}
+        self.chain_reqid_to_symbol = {}
+        self.stock_conid_reqid_to_symbol = {}
+        self.secdef_reqid_to_symbol = {}
+        self._pending_expirations = {}
+        self.extra_leg_reqid_to_leg = {}
+        self.order_symbol = {}
+        self.order_intents = {}
+        self.order_leg = {}
+        self.combo_leg_fills = {}
+        self._next_reqid = 100000                 # [FIX-9] can never collide with order ids
+        self._account_summary_reqid = 900001      # [FIX-9]
+        self._discovered_shares = {}
+        self._discovered_share_avgcost = {}
+        self._discovered_short_calls = {}
+        self._initial_snapshot_done = False
+
+        # [FIX-1/5/7] share-safety bookkeeping
+        self._discovered_short_shares = {}     # sym -> shares SHORT (positive number), snapshot in progress
+        self._trusted_shares = {}              # last COMPLETED snapshot: long shares
+        self._trusted_short_shares = {}        # last COMPLETED snapshot: short shares
+        self._snapshot_started_at = 0.0
+        self._trusted_snapshot_started_at = 0.0
+        self._snapshot_in_progress = False
+        self._refresh_scheduled = False
+        self.working_share_orders = {}         # orderId -> (sym, "BUY"/"SELL"/"COMBO", qty); cleared ONLY by orderStatus/real errors
+        self.last_share_activity = {}          # sym -> time of last share order submit/fill/cancel
+        self._last_solvency_close = 0.0
+        self._solvency_cancel_sent = set()
+        self._untracked_call_warned = set()
+
+        # [FIX-11] option-close orders still working, per symbol
+        self.close_orders_pending = {}         # orderId -> sym
+        # [FIX-14] new-position sell-to-open orders still working, per symbol — cancelled at
+        # end-of-day shutdown so nothing carries a stale limit price into the next session.
+        self.open_call_orders_pending = {}     # orderId -> sym
+
+        self.liquidation_needed_symbols = set()
+        self.liquidation_pending_symbols = set()
+
+        self.entry_dte_ledger = self.load_entry_dte_ledger()
+
+        self.risk_per_trade_pct = 0.01
+        self.take_profit_pct = round(1.0 - PROFIT_CAPTURE_PCT, 4)
+        self.stop_loss_multiple = 2.0
+        self.target_delta = TARGET_DELTA
+
+        self.new_positions_opened_today = 0
+        self._cash_earmarked_this_pass = 0.0
+        self.pending_order_cash = {}
+        self.cash_solvency_halt = False
+        self.committed_capital = 0.0
+
+        self.starting_balance = 0.0
+        self.closing_balance = 0.0
+        self.starting_cash = 0.0
+        self.current_cash = 0.0
+        self.excess_liquidity = 0.0
+        self.excess_liquidity_ready = False
+        self.account_balance_ready = False
+        self.shares_position_ready = False
+        self.total_trades = 0
+        self.wins = 0
+        self.session_history = self.load_session_history()
+
+        self.max_daily_drawdown_pct = 0.08
+        self.max_daily_markup_pct = 0.15
+        self.system_halted = False
+
+    def allocate_reqid(self):
+        self._next_reqid += 1
+        return self._next_reqid
+
+    def allocate_order_id(self):
+        order_id = self.next_order_id
+        self.next_order_id += 1
+        return order_id
+
+    @staticmethod
+    def _stock_contract(sym):
+        c = Contract()
+        c.symbol = sym
+        c.secType = "STK"
+        c.exchange = "SMART"
+        c.currency = "USD"
+        return c
+
+    # ------------------------------------------------------------------ [FIX-6] cash sizing
+    def short_stock_market_value(self):
+        total = 0.0
+        for sym, qty in self._trusted_short_shares.items():
+            st = self.symbol_states.get(sym)
+            price = st.live_stock_price if st and st.live_stock_price > 0 else 0.0
+            total += qty * price
+        return total
+
+    def available_cash_for_new_trades(self):
+        """Cash the bot may deploy. Never includes short-sale proceeds, never exceeds
+        excess liquidity, and is zero while any short stock exists."""
+        if BLOCK_NEW_TRADES_WHILE_SHORT and self._trusted_short_shares:
+            return 0.0
+        cash = self.current_cash - self.short_stock_market_value()
+        if self.excess_liquidity_ready:
+            cash = min(cash, self.excess_liquidity)
+        reserved = sum(self.pending_order_cash.values()) + self._cash_earmarked_this_pass
+        return cash - reserved
+
+    # ------------------------------------------------------------------ [FIX-10] exposure cap
+    def long_stock_exposure(self):
+        """Broker-confirmed long stock value + every working buy-write order + anything
+        earmarked earlier in this same evaluation pass. Used to hard-cap total long
+        exposure against Net Liquidation so the bot never relies on margin."""
+        total = 0.0
+        for sym, qty in self._trusted_shares.items():
+            st = self.symbol_states.get(sym)
+            px = st.live_stock_price if (st and st.live_stock_price > 0) else self._discovered_share_avgcost.get(sym, 0.0)
+            total += qty * px
+        return total + sum(self.pending_order_cash.values()) + self._cash_earmarked_this_pass
+
+    def count_active_positions(self):
+        count = 0
+        for state in self.symbol_states.values():
+            if state.position_active or any(leg.position_active for leg in state.other_option_legs):
+                count += 1
+        return count
+
+    # ------------------------------------------------------------------ [FIX-15] combined P&L
+    def stock_unrealized_pl(self, sym):
+        """Unrealized P&L on the STOCK leg only. Needs a known cost basis; returns 0.0
+        (neutral) rather than guessing if we don't have one yet."""
+        state = self.symbol_states.get(sym)
+        if not state or state.shares_owned <= 0 or state.avg_stock_cost <= 0 or state.live_stock_price <= 0:
+            return 0.0
+        return (state.live_stock_price - state.avg_stock_cost) * state.shares_owned
+
+    def total_call_unrealized_pl(self, sym):
+        """Unrealized P&L across every currently-active short call on this symbol (the
+        primary leg plus any extra legs). Option quotes are per-share, so x100 each."""
+        state = self.symbol_states.get(sym)
+        if not state:
+            return 0.0
+        total = 0.0
+        if state.position_active and state.live_option_ask > 0:
+            total += (state.entry_credit - state.live_option_ask) * 100.0 * state.position_quantity
+        for leg in state.other_option_legs:
+            if leg.position_active and leg.live_option_ask > 0:
+                total += (leg.entry_credit - leg.live_option_ask) * 100.0 * leg.position_quantity
+        return total
+
+    def combined_position_pl(self, sym):
+        """THE fix for the reported bug: total covered-call P&L (stock + every short call
+        together), so exit decisions are judged against the position's real risk instead of
+        the option price in isolation."""
+        return self.stock_unrealized_pl(sym) + self.total_call_unrealized_pl(sym)
+
+    def build_position_snapshot_lines(self):
+        lines = []
+        for sym, state in sorted(self.symbol_states.items()):
+            has_shares = state.shares_owned > 0
+            has_primary = state.position_active
+            has_extra = any(leg.position_active for leg in state.other_option_legs)
+            if not (has_shares or has_primary or has_extra):
+                continue
+            parts = []
+            if has_shares:
+                share_value = state.shares_owned * state.live_stock_price
+                parts.append(f"{state.shares_owned} sh @ ${state.live_stock_price:,.2f} (${share_value:,.2f})")
+            if has_primary:
+                live_dte = self.compute_days_to_expiry(state.target_option)
+                unrealized = round((state.entry_credit - state.live_option_ask) * 100.0 * state.position_quantity, 2)
+                parts.append(
+                    f"short {state.position_quantity}x ${state.target_option.strike} call "
+                    f"(credit ${state.entry_credit}, now ${state.live_option_ask}, {live_dte:.1f}d left, "
+                    f"unrealized {'+' if unrealized >= 0 else ''}${unrealized:,.2f})"
+                )
+            for leg in state.other_option_legs:
+                if not leg.position_active:
+                    continue
+                live_dte = self.compute_days_to_expiry(leg.contract)
+                unrealized = round((leg.entry_credit - leg.live_option_ask) * 100.0 * leg.position_quantity, 2)
+                parts.append(
+                    f"short {leg.position_quantity}x ${leg.contract.strike} call [{leg.contract.localSymbol}] "
+                    f"(credit ${leg.entry_credit}, now ${leg.live_option_ask}, {live_dte:.1f}d left, "
+                    f"unrealized {'+' if unrealized >= 0 else ''}${unrealized:,.2f})"
+                )
+            lines.append(f"   {sym}: " + " | ".join(parts))
+        return lines
+
+    def load_session_history(self):
+        if not os.path.exists(SESSION_HISTORY_PATH):
+            return []
+        try:
+            with open(SESSION_HISTORY_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def save_session_history(self):
+        try:
+            with open(SESSION_HISTORY_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.session_history, f, indent=2)
+        except OSError as e:
+            print(f"⚠️ Could not write session history: {e}")
+
+    def append_todays_session(self):
+        entry = {
+            "date": datetime.datetime.now().strftime("%Y-%m-%d"),
+            "starting_net_liq": self.starting_balance,
+            "closing_net_liq": self.closing_balance,
+            "starting_cash": self.starting_cash,
+            "closing_cash": self.current_cash,
+            "trades": self.total_trades,
+            "wins": self.wins,
+            "net_pl_whole_portfolio": round(self.closing_balance - self.starting_balance, 2),
+            "new_positions_opened": self.new_positions_opened_today,
+            "committed_capital": round(self.committed_capital, 2),
+            "symbols_traded": sorted(self.symbol_states.keys()),
+        }
+        self.session_history.append(entry)
+        self.save_session_history()
+
+    def load_entry_dte_ledger(self):
+        if not os.path.exists(ENTRY_DTE_LEDGER_PATH):
+            return {}
+        try:
+            with open(ENTRY_DTE_LEDGER_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def save_entry_dte_ledger(self):
+        try:
+            with open(ENTRY_DTE_LEDGER_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.entry_dte_ledger, f, indent=2)
+        except OSError as e:
+            print(f"⚠️ Could not write entry-DTE ledger: {e}")
+
+    def record_entry_dte(self, con_id, entry_days_to_expiry):
+        if not con_id:
+            return
+        self.entry_dte_ledger[str(con_id)] = {
+            "entry_days_to_expiry": entry_days_to_expiry,
+            "recorded_on": datetime.datetime.now().strftime("%Y-%m-%d"),
+        }
+        self.save_entry_dte_ledger()
+
+    def pop_entry_dte(self, con_id):
+        if not con_id:
+            return
+        key = str(con_id)
+        if key in self.entry_dte_ledger:
+            del self.entry_dte_ledger[key]
+            self.save_entry_dte_ledger()
+
+    def nextValidId(self, orderId: int):
+        self.next_order_id = orderId
+        print(f"🎉 BUY-WRITE BASKET ENGINE (SAFE) ONLINE. ACTIVE ID: {self.next_order_id}")
+        self.reqMarketDataType(3)
+        self.write_to_notepad("SYSTEM UPDATE: Buy-write basket engine launched.")
+        print("💳 Requesting live NetLiquidation, TotalCashValue AND ExcessLiquidity...")
+        self.reqAccountSummary(self._account_summary_reqid, "All", "NetLiquidation,TotalCashValue,ExcessLiquidity")
+        print("📦 Scanning existing portfolio positions...")
+        self.request_position_snapshot()
+        self.reconcile_open_orders()
+        self.check_market_clock()
+
+    BENIGN_INFO_CODES = {1100, 1101, 1102, 2103, 2104, 2105, 2106, 2107, 2108, 2119, 2137, 2158, 10349}
+
+    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+        # [FIX-2] Only REAL failures (IB codes < 1000, excluding the 399 order warning)
+        # release order-tracking state. Warnings like 10349 must NOT, otherwise the orphan
+        # sweep believes the sale never went in and sells again.
+        is_real_failure = errorCode < 1000 and errorCode != 399
+
+        if is_real_failure and reqId in self.pending_order_cash:
+            freed = self.pending_order_cash.pop(reqId)
+            note = f"↩️ Released ${freed:,.2f} cash reservation for order {reqId} after error/rejection (code {errorCode})."
+            print(note)
+            self.write_to_notepad(note)
+
+        if is_real_failure and reqId in self.working_share_orders:
+            w_sym, w_action, w_qty = self.working_share_orders.pop(reqId)
+            self.last_share_activity[w_sym] = time.time()
+            if w_action == "SELL":
+                self.liquidation_pending_symbols.discard(w_sym)
+            note = (f"↩️ {w_sym}: {w_action} {w_qty} order {reqId} failed (code {errorCode}) — "
+                    f"will act again only after a fresh position snapshot.")
+            print(note)
+            self.write_to_notepad(note)
+            self.schedule_snapshot_refresh()
+
+        if is_real_failure and reqId in self.close_orders_pending:
+            c_sym = self.close_orders_pending.pop(reqId)
+            note = f"↩️ {c_sym}: buy-to-close order {reqId} failed (code {errorCode}) — will retry from the next exit check."
+            print(note)
+            self.write_to_notepad(note)
+
+        if is_real_failure and reqId in self.open_call_orders_pending:  # [FIX-14]
+            self.open_call_orders_pending.pop(reqId)
+
+        if errorCode in self.BENIGN_INFO_CODES:
+            print(f"ℹ️ [{errorCode}] {errorString}")
+            return
+        if errorCode == 201:
+            msg = (
+                f"🚫 IB ERROR [reqId={reqId}] Code 201: {errorString} — ACCOUNT PERMISSION setting. "
+                f"Set STANDALONE_COVERED_CALL_PERMISSION_GRANTED=True once IB confirms the permission."
+            )
+        elif errorCode == 321:
+            msg = f"🚫 IB ERROR [reqId={reqId}] Code 321: {errorString} — missing exchange or conId."
+        else:
+            msg = f"⚠️ IB ERROR [reqId={reqId}] Code {errorCode}: {errorString}"
+        print(msg)
+        self.write_to_notepad(msg)
+
+    def marketDataType(self, reqId: int, marketDataType: int):
+        mode_labels = {1: "LIVE", 2: "FROZEN", 3: "DELAYED", 4: "DELAYED FROZEN"}
+        print(f"📶 Market data mode confirmed for reqId {reqId}: {mode_labels.get(marketDataType, marketDataType)}")
+
+    def accountSummary(self, reqId, account, tag, value, currency):
+        print(f"🧾 accountSummary received: tag={tag} currency={currency} value={value}")
+        if tag == "NetLiquidation":
+            if currency in ("BASE", "USD"):
+                self.closing_balance = float(value)
+                if not self.account_balance_ready:
+                    self.starting_balance = self.closing_balance
+                    self.account_balance_ready = True
+                    msg = f"💰 LIVE NET LIQUIDATION LOADED: ${self.starting_balance:,.2f}."
+                    print(msg)
+                    self.write_to_notepad(msg)
+        elif tag == "TotalCashValue":
+            if currency in ("BASE", "USD"):
+                self.current_cash = float(value)
+                if self.starting_cash == 0.0:
+                    self.starting_cash = self.current_cash
+                    msg = f"💵 LIVE CASH LOADED: ${self.starting_cash:,.2f}."
+                    print(msg)
+                    self.write_to_notepad(msg)
+        elif tag == "ExcessLiquidity":
+            if currency in ("BASE", "USD"):
+                self.excess_liquidity = float(value)
+                self.excess_liquidity_ready = True
+        self.enforce_cash_solvency()
+
+    def accountSummaryEnd(self, reqId):
+        if not self.account_balance_ready:
+            warn = "⚠️ accountSummaryEnd fired but no NetLiquidation was ever received."
+            print(warn)
+            self.write_to_notepad(warn)
+
+    # ------------------------------------------------------------------ [FIX-4] solvency
+    def enforce_cash_solvency(self):
+        """Driven by EXCESS LIQUIDITY. Negative cash alone (a margin loan) is not a breach.
+          soft floor -> stop opening new trades and cancel working buy-write orders
+          hard floor -> additionally close ONE position at a time, at most once per cooldown"""
+        if not self.account_balance_ready or not self.excess_liquidity_ready:
+            return
+        soft_floor = max(MIN_CASH_BUFFER, self.closing_balance * EXCESS_LIQ_SOFT_PCT)
+        hard_floor = max(MIN_CASH_BUFFER, self.closing_balance * EXCESS_LIQ_HARD_PCT)
+
+        if self.excess_liquidity >= soft_floor:
+            if self.cash_solvency_halt:
+                msg = f"✅ Solvency restored: excess liquidity ${self.excess_liquidity:,.2f} (cash ${self.current_cash:,.2f})."
+                print(msg)
+                self.write_to_notepad(msg)
+            self.cash_solvency_halt = False
+            self._solvency_cancel_sent.clear()
+            return
+
+        if not self.cash_solvency_halt:
+            warn = (f"🚨 SOLVENCY WARNING: excess liquidity ${self.excess_liquidity:,.2f} is below the soft floor "
+                    f"${soft_floor:,.2f} (cash ${self.current_cash:,.2f}). New trades halted.")
+            print(f"\n{warn}")
+            self.write_to_notepad(warn)
+        self.cash_solvency_halt = True
+
+        for order_id in list(self.pending_order_cash.keys()):
+            if order_id in self._solvency_cancel_sent:
+                continue
+            self._solvency_cancel_sent.add(order_id)
+            note = f"🩹 SOLVENCY: cancelling still-working order {order_id}."
+            print(note)
+            self.write_to_notepad(note)
+            try:
+                self.cancelOrder(order_id, "")
+            except TypeError:
+                self.cancelOrder(order_id)
+
+        if self.excess_liquidity < hard_floor and self.shares_position_ready:
+            self.close_largest_position_for_solvency()
+
+    def close_largest_position_for_solvency(self):
+        # [FIX-4] Used to run every second with no memory of what it had already sold.
+        # [FIX-12] Cooldown widened so it comfortably outlasts one account-summary refresh.
+        now = time.time()
+        if now - self._last_solvency_close < SOLVENCY_CLOSE_COOLDOWN_SECONDS:
+            return
+        self._last_solvency_close = now
+
+        candidates = []
+        for sym, state in self.symbol_states.items():
+            # [FIX-11] never pick a symbol whose call-close is already working — picking it
+            # again would try to sell shares that still have a naked-call risk behind them.
+            if any(oid_sym == sym for oid_sym in self.close_orders_pending.values()):
+                continue
+            held = self._trusted_shares.get(sym, 0)
+            if state.position_active or held > 0:
+                est_value = held * state.live_stock_price
+                candidates.append((est_value, sym, state, None, held))
+            for leg in state.other_option_legs:
+                if leg.position_active:
+                    est_value = leg.position_quantity * leg.live_option_ask * 100.0
+                    candidates.append((est_value, sym, state, leg, held))
+
+        if not candidates:
+            warn = "⚠️ Solvency breach persists but no open bot-tracked positions remain to close."
+            print(warn)
+            self.write_to_notepad(warn)
+            return
+
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        est_value, sym, state, leg, held = candidates[0]
+
+        if leg is not None:
+            print(f"🩹 SOLVENCY CLOSE: {sym} ({leg.contract.localSymbol}), est. value ${est_value:,.2f}.")
+            leg.position_active = False
+            self.trigger_close_leg_payload(sym, leg)
+            return
+
+        print(f"🩹 SOLVENCY CLOSE: {sym}, est. value ${est_value:,.2f}.")
+        if state.position_active:
+            state.position_active = False
+            self.trigger_close_covered_call_payload(sym)
+            # [FIX-11] don't also sell shares this same pass — the buy-to-close just
+            # submitted hasn't filled yet. The next reconcile/solvency pass sells them
+            # once close_orders_pending confirms it's done.
+            return
+        if held > 0:
+            self.trigger_liquidate_shares(sym, held)
+
+    def reconcile_open_orders(self):
+        print("🔄 Reconciling in-flight orders from before this process started...")
+        self.reqOpenOrders()
+
+    def openOrder(self, orderId, contract, order, orderState):
+        # [FIX-3] openOrder also fires for orders that just FINISHED. Re-registering those as
+        # "in flight" would block the symbol forever.
+        if getattr(orderState, "status", "") in TERMINAL_ORDER_STATUSES:
+            return
+        sym = contract.symbol
+        if not sym:
+            return
+        already_known = orderId in self.order_intents
+        self.order_symbol[orderId] = sym
+
+        if contract.secType == "BAG":
+            self.order_intents[orderId] = "OPEN_COMBO"
+            if orderId not in self.combo_leg_fills:
+                self.combo_leg_fills[orderId] = {
+                    "expected_lots": int(order.totalQuantity),
+                    "stk_shares_filled": 0,
+                    "stk_cost_total": 0.0,
+                    "opt_contracts_filled": 0,
+                    "opt_credit_total": 0.0,
+                }
+            if orderId not in self.pending_order_cash:
+                est_cost = abs(order.lmtPrice) * float(order.totalQuantity) * 100.0
+                self.pending_order_cash[orderId] = est_cost
+            self.working_share_orders[orderId] = (sym, "COMBO", int(order.totalQuantity))
+        elif contract.secType == "OPT":
+            if order.action == "SELL":
+                self.order_intents[orderId] = "OPEN"
+            else:
+                self.order_intents[orderId] = "CLOSE"
+                self.close_orders_pending[orderId] = sym
+        elif contract.secType == "STK":
+            if order.action == "SELL":
+                self.order_intents[orderId] = "LIQUIDATE_SHARES"
+                self.liquidation_needed_symbols.add(sym)
+                self.liquidation_pending_symbols.add(sym)
+            else:
+                self.order_intents[orderId] = "SHARE_BUY"
+            self.working_share_orders[orderId] = (sym, order.action, int(order.totalQuantity))
+        else:
+            return
+
+        if not already_known:
+            if orderId in self.working_share_orders:
+                self.last_share_activity[sym] = time.time()
+            msg = f"🔄 Recovered in-flight order {orderId} ({self.order_intents[orderId]}) for {sym}."
+            print(msg)
+            self.write_to_notepad(msg)
+
+    def openOrderEnd(self):
+        combo_order_ids = [oid for oid, intent in self.order_intents.items()
+                           if intent == "OPEN_COMBO" and oid in self.combo_leg_fills]
+        if not combo_order_ids:
+            print("🔄 Open-order reconciliation complete — nothing to backfill.")
+            return
+        print(f"🔄 Backfilling today's executions for {len(combo_order_ids)} recovered combo order(s)...")
+        filt = ExecutionFilter()
+        filt.time = datetime.datetime.now().strftime("%Y%m%d 00:00:00")
+        self.reqExecutions(self.allocate_reqid(), filt)
+
+    # ------------------------------------------------------------------ position snapshots
+    def request_position_snapshot(self):
+        # Don't start a second snapshot while one is still streaming (would wipe its data).
+        if self._snapshot_in_progress and (time.time() - self._snapshot_started_at) < SNAPSHOT_TIMEOUT_SECONDS:
+            return
+        self._discovered_shares = {}
+        self._discovered_share_avgcost = {}
+        self._discovered_short_calls = {}
+        self._discovered_short_shares = {}
+        self._snapshot_started_at = time.time()
+        self._snapshot_in_progress = True
+        self.reqPositions()
+
+    def schedule_snapshot_refresh(self):
+        """Take a fresh snapshot shortly after a share order finishes, so the freshness
+        gate re-opens quickly instead of waiting for the next 60s heartbeat."""
+        if self._refresh_scheduled:
+            return
+        self._refresh_scheduled = True
+
+        def _go():
+            self._refresh_scheduled = False
+            if self._initial_snapshot_done:
+                self.request_position_snapshot()
+
+        t = threading.Timer(SNAPSHOT_SETTLE_SECONDS + 1.0, _go)
+        t.daemon = True
+        t.start()
+
+    def position(self, account, contract, position: float, avgCost: float):
+        if contract.secType == "STK" and position > 0:
+            self._discovered_shares[contract.symbol] = int(position)
+            self._discovered_share_avgcost[contract.symbol] = avgCost
+        elif contract.secType == "STK" and position < 0:
+            # [FIX-5] record borrowed / short shares so they can be bought back
+            self._discovered_short_shares[contract.symbol] = int(-position)
+        elif contract.secType == "OPT" and contract.right == "C" and position < 0:
+            self._discovered_short_calls.setdefault(contract.symbol, []).append((contract, int(position), avgCost))
+
+    def recompute_committed_capital(self):
+        total = 0.0
+        for sym, state in self.symbol_states.items():
+            if not state.opened_by_bot:
+                continue
+            qty = self._discovered_shares.get(sym, 0)
+            avg_cost = self._discovered_share_avgcost.get(sym, 0.0)
+            total += qty * avg_cost
+        old = self.committed_capital
+        self.committed_capital = round(total, 2)
+        if abs(self.committed_capital - old) > 0.01:
+            print(f"🧮 committed_capital recalculated: ${old:,.2f} -> ${self.committed_capital:,.2f}")
+
+    def positionEnd(self):
+        self.shares_position_ready = True
+        self._snapshot_in_progress = False
+        # [FIX-1] Promote this completed snapshot to "trusted", remembering when it STARTED.
+        self._trusted_shares = dict(self._discovered_shares)
+        self._trusted_short_shares = dict(self._discovered_short_shares)
+        self._trusted_snapshot_started_at = self._snapshot_started_at
+
+        if not self._initial_snapshot_done:
+            self._initial_snapshot_done = True
+
+            for sym, qty in self._discovered_shares.items():
+                state = SymbolState(sym, category="existing_holding", is_existing_holding=True)
+                state.shares_owned = qty
+                self.symbol_states[sym] = state
+                if qty >= MIN_SHARES_FOR_COVER:
+                    msg = f"📦 {sym}: {qty} shares held -> can cover up to {qty // 100} call contract(s)."
+                else:
+                    msg = f"📦 {sym}: {qty} shares held (odd lot) -> monitoring only, no new calls written."
+                print(msg)
+                self.write_to_notepad(msg)
+
+            for sym, calls in self._discovered_short_calls.items():
+                if sym not in self.symbol_states:
+                    state = SymbolState(sym, category="existing_holding", is_existing_holding=True)
+                    state.shares_owned = self._discovered_shares.get(sym, 0)
+                    self.symbol_states[sym] = state
+                    warn = f"⚠️ {sym}: existing short call found but insufficient share cover on record."
+                    print(warn)
+                    self.write_to_notepad(warn)
+
+                state = self.symbol_states[sym]
+                if len(calls) > 1:
+                    print(f"ℹ️ {sym}: {len(calls)} existing short calls found — tracking all of them.")
+
+                contract, qty, avg_cost = calls[0]
+                if not contract.exchange:
+                    contract.exchange = "SMART"
+                state.target_option = contract
+                state.position_active = True
+                state.position_quantity = abs(qty)
+                # IB's avgCost for OPTIONS is per CONTRACT (x100); every quote this engine
+                # compares against is per SHARE, so normalize.
+                per_share_avg_cost = round(avg_cost / 100.0, 4)
+                print(f"🧾 {sym}: RAW avgCost for existing short call: {avg_cost} (per-contract) "
+                      f"-> normalized to ${per_share_avg_cost} per share — cross-check against IBKR Portfolio tab.")
+                state.entry_credit = per_share_avg_cost
+                state.take_profit_target = round(per_share_avg_cost * self.take_profit_pct, 2)
+                state.stop_loss_target = round(per_share_avg_cost * self.stop_loss_multiple, 2)
+                # [FIX-15] IB's avgCost for the STOCK position is already per-share (unlike the
+                # option avgCost normalized above), so this is a direct cost basis for the
+                # combined stock+call P&L check used by the exit logic.
+                state.avg_stock_cost = self._discovered_share_avgcost.get(sym, 0.0)
+                if state.avg_stock_cost <= 0:
+                    print(f"⚠️ {sym}: no share cost basis on record — combined stock+call P&L "
+                          f"checks will read as neutral (0.0) until a fresh buy-write sets one.")
+                state.has_executed = True
+                state.contract_resolved = True
+                state.days_to_expiry = self.compute_days_to_expiry(contract)
+
+                ledger_entry = self.entry_dte_ledger.get(str(contract.conId))
+                if ledger_entry:
+                    state.entry_days_to_expiry = ledger_entry["entry_days_to_expiry"]
+                    dte_source = f"recovered from ledger (recorded {ledger_entry.get('recorded_on', '?')})"
+                else:
+                    state.entry_days_to_expiry = state.days_to_expiry
+                    self.record_entry_dte(contract.conId, state.entry_days_to_expiry)
+                    dte_source = "NO ledger record found — using today's DTE as a one-time approximation and recording it now"
+
+                reqid = self.allocate_reqid()
+                state.data_reqid = reqid
+                self.reqid_to_symbol[reqid] = sym
+                self.reqMktData(reqid, contract, "", False, False, [])
+                print(f"🔁 {sym}: RESUMING existing PRIMARY position, short {state.position_quantity} contract(s). "
+                      f"Entry DTE {state.entry_days_to_expiry:.1f} ({dte_source}).")
+
+                for extra_contract, extra_qty, extra_avg_cost in calls[1:]:
+                    if not extra_contract.exchange:
+                        extra_contract.exchange = "SMART"
+                    extra_live_dte = self.compute_days_to_expiry(extra_contract)
+                    extra_ledger_entry = self.entry_dte_ledger.get(str(extra_contract.conId))
+                    if extra_ledger_entry:
+                        extra_entry_dte = extra_ledger_entry["entry_days_to_expiry"]
+                    else:
+                        extra_entry_dte = extra_live_dte
+                        self.record_entry_dte(extra_contract.conId, extra_entry_dte)
+
+                    per_share_extra_avg_cost = round(extra_avg_cost / 100.0, 4)
+                    leg = OptionLeg(extra_contract, abs(extra_qty), per_share_extra_avg_cost, entry_days_to_expiry=extra_entry_dte)
+                    leg.take_profit_target = round(per_share_extra_avg_cost * self.take_profit_pct, 2)
+                    leg.stop_loss_target = round(per_share_extra_avg_cost * self.stop_loss_multiple, 2)
+                    leg_reqid = self.allocate_reqid()
+                    leg.data_reqid = leg_reqid
+                    self.extra_leg_reqid_to_leg[leg_reqid] = (sym, leg)
+                    state.other_option_legs.append(leg)
+                    self.reqMktData(leg_reqid, extra_contract, "", False, False, [])
+                    print(f"🔁 {sym}: RESUMING additional short call leg {extra_contract.localSymbol}, "
+                          f"qty {leg.position_quantity}, entry DTE {extra_entry_dte:.1f} "
+                          f"(RAW avgCost {extra_avg_cost} -> ${per_share_extra_avg_cost}/share).")
+
+            for sym, state in self.symbol_states.items():
+                if not state.contract_resolved:
+                    self.start_stock_conid_lookup(sym)
+
+            self.scan_candidate_universe()
+
+        else:
+            # RECONCILIATION PASS
+            for sym, state in self.symbol_states.items():
+                actual_shares = self._discovered_shares.get(sym, 0)
+                has_active_other_legs = any(leg.position_active for leg in state.other_option_legs)
+                has_option_coverage = state.position_active or has_active_other_legs
+                calls = self._discovered_short_calls.get(sym, [])
+
+                # [FIX-8] The broker shows a short call the bot isn't tracking (e.g. a combo whose
+                # fills were never fully tallied). Selling the shares behind it would leave a NAKED
+                # call, so leave this symbol completely alone until a restart adopts it.
+                if calls and not has_option_coverage:
+                    if sym not in self._untracked_call_warned:
+                        self._untracked_call_warned.add(sym)
+                        w = (f"⚠️ {sym}: broker shows {len(calls)} short call position(s) this session isn't "
+                             f"tracking. NOT touching the shares behind them. Restart the engine to adopt it.")
+                        print(w)
+                        self.write_to_notepad(w)
+                    continue
+
+                liquidation_already_in_flight = sym in self.liquidation_pending_symbols
+                # [FIX-13] never auto-liquidate a bare holding outside the traded universe — the
+                # bot only understands buy-write recycling for symbols it's actually set up to trade.
+                in_universe = sym in ALL_UNIVERSE_SYMBOLS
+                is_bare_share_holding = (
+                    (not has_option_coverage) and actual_shares > 0 and not liquidation_already_in_flight
+                    and in_universe
+                )
+                if (not has_option_coverage) and actual_shares > 0 and not liquidation_already_in_flight and not in_universe:
+                    if sym not in self._untracked_call_warned:
+                        self._untracked_call_warned.add(sym)
+                        w = (f"ℹ️ {sym}: {actual_shares} bare share(s) held outside the traded universe "
+                             f"({sorted(ALL_UNIVERSE_SYMBOLS)}) — leaving alone, not auto-liquidating.")
+                        print(w)
+                        self.write_to_notepad(w)
+
+                if not has_option_coverage and not is_bare_share_holding:
+                    continue
+
+                if actual_shares != state.shares_owned:
+                    print(f"📦 {sym}: share count changed {state.shares_owned} -> {actual_shares}")
+                    state.shares_owned = actual_shares
+
+                if state.position_active and state.target_option is not None:
+                    match_qty = next((qty for (c, qty, ac) in calls if c.conId == state.target_option.conId), None)
+                    actual_qty = abs(match_qty) if match_qty is not None else 0
+                    if actual_qty < state.position_quantity:
+                        expected = state.position_quantity
+                        state.position_quantity = actual_qty
+                        note = (
+                            f"ℹ️ {sym} PRIMARY leg quantity {expected} -> {actual_qty} (expired or assigned "
+                            f"outside a bot order — full or partial, treated the same, no halt)."
+                        )
+                        print(note)
+                        self.write_to_notepad(note)
+                        if actual_qty == 0:
+                            state.position_active = False
+                            self.pop_entry_dte(state.target_option.conId)
+
+                for leg in state.other_option_legs:
+                    if not leg.position_active:
+                        continue
+                    match_qty = next((qty for (c, qty, ac) in calls if c.conId == leg.contract.conId), None)
+                    actual_qty = abs(match_qty) if match_qty is not None else 0
+                    if actual_qty < leg.position_quantity:
+                        expected = leg.position_quantity
+                        leg.position_quantity = actual_qty
+                        note = (
+                            f"ℹ️ {sym} ({leg.contract.localSymbol}) leg quantity {expected} -> {actual_qty} "
+                            f"(expired or assigned, full or partial — treated the same, no halt)."
+                        )
+                        print(note)
+                        self.write_to_notepad(note)
+                        if actual_qty == 0:
+                            leg.position_active = False
+                            self.pop_entry_dte(leg.contract.conId)
+
+                if is_bare_share_holding:
+                    note = (
+                        f"🧹 {sym}: {actual_shares} share(s) held with NO call coverage at all (either never "
+                        f"had one, or standalone covered-call writing is permission-blocked on this account) "
+                        f"— recycling now so this symbol is genuinely freed up for a brand-new buy-write "
+                        f"instead of sitting stuck indefinitely."
+                    )
+                    print(note)
+                    self.write_to_notepad(note)
+
+                if not (sym in self.liquidation_pending_symbols):
+                    self.maybe_recycle_if_fully_closed(sym)
+
+        self.recompute_committed_capital()
+        self.cover_short_shares()          # [FIX-5]
+        self.sweep_orphaned_shares()
+        self.cancelPositions()
+
+    def scan_candidate_universe(self):
+        for category, symbols in CANDIDATE_UNIVERSE.items():
+            for sym in symbols:
+                if sym in self.symbol_states:
+                    continue
+                state = SymbolState(sym, category=category, is_existing_holding=False)
+                self.symbol_states[sym] = state
+                self.start_stock_conid_lookup(sym)
+
+    def start_stock_conid_lookup(self, symbol):
+        state = self.symbol_states.get(symbol)
+        if state and state.stock_conid:
+            self.start_chain_lookup(symbol)
+            return
+
+        stock_contract = self._stock_contract(symbol)
+        reqid = self.allocate_reqid()
+        self.stock_conid_reqid_to_symbol[reqid] = symbol
+        self.reqContractDetails(reqid, stock_contract)
+
+    def start_chain_lookup(self, symbol):
+        state = self.symbol_states.get(symbol)
+        if not state or not state.stock_conid:
+            warn = f"⚠️ {symbol}: start_chain_lookup() called without a resolved stock conId — skipping."
+            print(warn)
+            self.write_to_notepad(warn)
+            return
+
+        conid = state.stock_conid
+        self._pending_expirations[symbol] = set()
+        reqid = self.allocate_reqid()
+        self.secdef_reqid_to_symbol[reqid] = symbol
+        print(f"🔍 {symbol}: discovering available option expirations (underlying conId {conid})...")
+        self.reqSecDefOptParams(reqid, symbol, "", "STK", conid)
+
+    def securityDefinitionOptionParameter(self, reqId, exchange, underlyingConId, tradingClass, multiplier, expirations, strikes):
+        sym = self.secdef_reqid_to_symbol.get(reqId)
+        if not sym:
+            return
+        self._pending_expirations.setdefault(sym, set()).update(expirations)
+
+    def securityDefinitionOptionParameterEnd(self, reqId):
+        sym = self.secdef_reqid_to_symbol.pop(reqId, None)
+        if not sym or sym not in self.symbol_states:
+            return
+        available = self._pending_expirations.pop(sym, set())
+        target_expiry = self.choose_target_expiration(available)
+        if not target_expiry:
+            warn = f"⚠️ {sym}: no usable (non-expired) option expirations found — skipping."
+            print(warn)
+            self.write_to_notepad(warn)
+            return
+        days_out = (datetime.datetime.strptime(target_expiry, "%Y%m%d").date() - datetime.date.today()).days
+        print(f"🗓️ {sym}: targeting expiration {target_expiry} ({days_out} days out, closest to {TARGET_DTE_DAYS}-day target).")
+        self.fetch_strikes_for_expiration(sym, target_expiry)
+
+    @staticmethod
+    def choose_target_expiration(expirations):
+        today = datetime.date.today()
+        best, best_diff = None, None
+        for exp_str in expirations:
+            try:
+                exp_date = datetime.datetime.strptime(exp_str, "%Y%m%d").date()
+            except ValueError:
+                continue
+            days_out = (exp_date - today).days
+            if days_out <= 0:
+                continue
+            diff = abs(days_out - TARGET_DTE_DAYS)
+            if best_diff is None or diff < best_diff:
+                best, best_diff = exp_str, diff
+        return best
+
+    def fetch_strikes_for_expiration(self, symbol, expiration_yyyymmdd):
+        chain_search = Contract()
+        chain_search.symbol = symbol
+        chain_search.secType = "OPT"
+        chain_search.exchange = "SMART"
+        chain_search.currency = "USD"
+        chain_search.lastTradeDateOrContractMonth = expiration_yyyymmdd
+        chain_search.right = "C"
+
+        reqid = self.allocate_reqid()
+        self.chain_reqid_to_symbol[reqid] = symbol
+        print(f"🔍 {symbol}: pulling call chain for {expiration_yyyymmdd}...")
+        self.reqContractDetails(reqid, chain_search)
+
+    def contractDetails(self, reqId: int, contractDetails):
+        if reqId in self.stock_conid_reqid_to_symbol:
+            sym = self.stock_conid_reqid_to_symbol[reqId]
+            if sym in self.symbol_states:
+                self.symbol_states[sym].stock_conid = contractDetails.contract.conId
+            return
+        sym = self.chain_reqid_to_symbol.get(reqId)
+        if sym and sym in self.symbol_states:
+            self.symbol_states[sym].chain_contracts.append(contractDetails)
+
+    def contractDetailsEnd(self, reqId: int):
+        if reqId in self.stock_conid_reqid_to_symbol:
+            sym = self.stock_conid_reqid_to_symbol.pop(reqId, None)
+            if not sym or sym not in self.symbol_states:
+                return
+            state = self.symbol_states[sym]
+            if not state.stock_conid:
+                warn = f"⚠️ {sym}: no contract details came back for the stock lookup — skipping option-chain lookup."
+                print(warn)
+                self.write_to_notepad(warn)
+                return
+            self.start_chain_lookup(sym)
+            return
+
+        sym = self.chain_reqid_to_symbol.get(reqId)
+        if not sym or sym not in self.symbol_states:
+            return
+        state = self.symbol_states[sym]
+        if state.contract_resolved:
+            return
+
+        if not state.chain_contracts:
+            warn = f"⚠️ {sym}: no call contracts found for the chosen expiration — skipping."
+            print(warn)
+            self.write_to_notepad(warn)
+            return
+
+        state.chain_contracts.sort(key=lambda cd: cd.contract.strike)
+        probe = state.chain_contracts[len(state.chain_contracts) // 2]
+        state.target_option = probe.contract
+        state.days_to_expiry = self.compute_days_to_expiry(state.target_option)
+
+        reqid = self.allocate_reqid()
+        state.data_reqid = reqid
+        self.reqid_to_symbol[reqid] = sym
+        print(f"🔍 {sym}: chain loaded ({len(state.chain_contracts)} strikes). Probing strike ${state.target_option.strike}...")
+        self.reqMktData(reqid, state.target_option, "", False, False, [])
+
+    def compute_days_to_expiry(self, option_contract):
+        try:
+            expiry_date = datetime.datetime.strptime(option_contract.lastTradeDateOrContractMonth, "%Y%m%d").date()
+            days = (expiry_date - datetime.date.today()).days
+            return max(days, 1)
+        except (ValueError, TypeError):
+            return 8.0
+
+    def finalize_target_contract(self, sym):
+        state = self.symbol_states[sym]
+        vol = state.implied_vol if state.implied_vol > 0 else FALLBACK_VOL
+
+        solved_strike = solve_strike_for_target_delta(
+            state.live_stock_price, state.days_to_expiry, 0.05, vol, self.target_delta
+        )
+        if solved_strike is not None:
+            target_price = solved_strike
+            method = f"delta-targeted (target {self.target_delta:.2f}, IV {vol:.1%}) -> analytical strike ${solved_strike:.2f}"
+        else:
+            target_price = state.live_stock_price * 1.02
+            method = "FALLBACK flat 2% OTM (delta solve unavailable)"
+
+        otm_candidates = [cd.contract for cd in state.chain_contracts if cd.contract.strike > state.live_stock_price]
+        pool = otm_candidates if otm_candidates else [cd.contract for cd in state.chain_contracts]
+        match = min(pool, key=lambda c: abs(c.strike - target_price))
+
+        if match.conId != state.target_option.conId:
+            self.cancelMktData(state.data_reqid)
+            state.target_option = match
+            state.days_to_expiry = self.compute_days_to_expiry(match)
+            state.live_option_ask = 0.0
+            state.live_option_bid = 0.0
+            print(f"🎯 {sym} resolved at ${state.live_stock_price}. {method}. Selected listed strike: {match.localSymbol}")
+            self.reqMktData(state.data_reqid, match, "", False, False, [])
+        else:
+            print(f"🎯 {sym} resolved at ${state.live_stock_price}. {method}. Probe strike was already the closest match.")
+
+        state.contract_resolved = True
+
+    def tickPrice(self, reqId: int, tickType: int, price: float, attrib):
+        if price <= 0 or self.system_halted:
+            return
+
+        extra_route = self.extra_leg_reqid_to_leg.get(reqId)
+        if extra_route is not None:
+            sym, leg = extra_route
+            if tickType in ASK_TICKS:
+                leg.live_option_ask = price
+            elif tickType in BID_TICKS:
+                leg.live_option_bid = price
+            elif tickType in CLOSE_TICKS:
+                if leg.live_option_ask == 0.0:
+                    leg.live_option_ask = price
+                if leg.live_option_bid == 0.0:
+                    leg.live_option_bid = price
+            if self.account_balance_ready and self.shares_position_ready and leg.position_active and leg.live_option_ask > 0:
+                self.monitor_leg_exit_targets(sym, leg)
+            return
+
+        sym = self.reqid_to_symbol.get(reqId)
+        if not sym or sym not in self.symbol_states:
+            return
+        state = self.symbol_states[sym]
+
+        if tickType in ASK_TICKS:
+            state.live_option_ask = price
+        elif tickType in BID_TICKS:
+            state.live_option_bid = price
+        elif tickType in CLOSE_TICKS:
+            if state.live_option_ask == 0.0:
+                state.live_option_ask = price
+            if state.live_option_bid == 0.0:
+                state.live_option_bid = price
+
+        if not self.account_balance_ready or not self.shares_position_ready:
+            return
+
+        if state.is_existing_holding:
+            if not state.has_executed and state.contract_resolved and state.live_stock_price > 0 and state.live_option_bid > 0:
+                self.evaluate_and_execute(sym)
+            elif state.position_active and state.live_option_ask > 0:
+                self.monitor_exit_targets(sym)
+
+    def tickOptionComputation(self, reqId, tickType, tickAttrib, impliedVol, delta,
+                               optPrice, pvDividend, gamma, vega, theta, undPrice):
+        sym = self.reqid_to_symbol.get(reqId)
+        if not sym or sym not in self.symbol_states or self.system_halted:
+            return
+        state = self.symbol_states[sym]
+
+        if impliedVol and impliedVol > 0:
+            state.implied_vol = impliedVol
+
+        if undPrice is None or undPrice <= 0:
+            return
+        state.live_stock_price = undPrice
+        if not state.contract_resolved:
+            self.finalize_target_contract(sym)
+
+    def calculate_position_size(self, sym):
+        state = self.symbol_states[sym]
+        if state.live_option_bid <= 0 or state.shares_owned < MIN_SHARES_FOR_COVER:
+            return 0
+        share_capped_qty = state.shares_owned // 100
+        stop_distance_per_share = state.live_option_bid * (self.stop_loss_multiple - 1.0)
+        loss_per_contract = stop_distance_per_share * 100.0
+        if loss_per_contract <= 0:
+            return share_capped_qty
+        dollar_risk_budget = self.closing_balance * self.risk_per_trade_pct
+        risk_based_qty = math.floor(dollar_risk_budget / loss_per_contract)
+        return max(0, min(share_capped_qty, risk_based_qty))
+
+    def evaluate_and_execute(self, sym):
+        state = self.symbol_states[sym]
+        vol = state.implied_vol if state.implied_vol > 0 else FALLBACK_VOL
+        theoretical_value = calculate_black_scholes_value(
+            state.live_stock_price, state.target_option.strike, state.days_to_expiry, 0.05, vol
+        )
+        if state.live_option_bid > theoretical_value:
+            quantity = self.calculate_position_size(sym)
+            if quantity < 1:
+                return
+
+            if not STANDALONE_COVERED_CALL_PERMISSION_GRANTED:
+                if not state.permission_warned:
+                    warn = (
+                        f"⛔ {sym}: signal found (bid ${state.live_option_bid} > fair value "
+                        f"${theoretical_value:.2f}, IV={vol:.1%}) but standalone covered-call writing is "
+                        f"disabled (Code 201 on prior attempts). Shares like these that never get a call "
+                        f"written on them are handled by the reconciliation-loop fix — they'll be sold "
+                        f"and recycled into a fresh buy-write COMBO instead of sitting stuck forever. Not "
+                        f"retrying a standalone write on this symbol further today."
+                    )
+                    print(warn)
+                    self.write_to_notepad(warn)
+                    state.permission_warned = True
+                return
+
+            state.has_executed = True
+            alert = f"💥 {sym} COVERED CALL SIGNAL! Bid ${state.live_option_bid} > Fair Value {theoretical_value} (IV={vol:.1%}). Writing: {quantity} contract(s)"
+            print(f"\n{alert}")
+            self.write_to_notepad(alert)
+            self.trigger_open_covered_call_payload(sym, quantity)
+
+    def trigger_open_covered_call_payload(self, sym, quantity):
+        state = self.symbol_states[sym]
+        self.write_to_notepad(f"ORDER ROUTING: Selling {quantity} {sym} covered call contract(s) to open...")
+        sell_to_open = Order()
+        sell_to_open.action = "SELL"
+        sell_to_open.orderType = "LMT"
+        sell_to_open.totalQuantity = quantity
+        sell_to_open.lmtPrice = state.live_option_bid
+        sell_to_open.transmit = True
+        sell_to_open.eTradeOnly = False
+        sell_to_open.firmQuoteOnly = False
+        order_id = self.allocate_order_id()
+        self.order_intents[order_id] = "OPEN"
+        self.order_symbol[order_id] = sym
+        self.open_call_orders_pending[order_id] = sym  # [FIX-14]
+        self.placeOrder(order_id, state.target_option, sell_to_open)
+
+    def maybe_recycle_if_fully_closed(self, sym):
+        state = self.symbol_states[sym]
+        if state.position_active:
+            return
+        if any(leg.position_active for leg in state.other_option_legs):
+            return
+        self.recycle_symbol_after_close(sym)
+
+    def monitor_exit_targets(self, sym):
+        state = self.symbol_states[sym]
+
+        live_dte = self.compute_days_to_expiry(state.target_option)
+        dte_floor = state.entry_days_to_expiry * DTE_BACKSTOP_PCT if state.entry_days_to_expiry > 0 else 0
+
+        # [FIX-15] Combined stock+call P&L, computed up front so every exit path below is
+        # judged against the position's REAL risk, not the call price in isolation.
+        combined_pl = self.combined_position_pl(sym)
+        cost_basis = state.avg_stock_cost * state.shares_owned if state.avg_stock_cost > 0 else 0.0
+        combined_pl_pct = (combined_pl / cost_basis) if cost_basis > 0 else None
+        real_stop = combined_pl_pct is not None and combined_pl_pct <= -COMBINED_STOP_LOSS_PCT
+
+        if state.entry_days_to_expiry > 0 and live_dte <= dte_floor:
+            state.position_active = False
+            option_pl = round((state.entry_credit - state.live_option_ask) * 100.0 * state.position_quantity, 2)
+            if combined_pl >= 0:
+                self.wins += 1
+            print(f"\n⏳ {sym} DTE BACKSTOP: {live_dte:.1f} days left <= {dte_floor:.1f} day floor. "
+                  f"Force-closing (call-only {'+' if option_pl>=0 else ''}${option_pl:,.2f}, "
+                  f"COMBINED stock+call {'+' if combined_pl>=0 else ''}${combined_pl:,.2f}).")
+            self.trigger_close_covered_call_payload(sym)
+            self.check_global_account_risk()
+            self.maybe_recycle_if_fully_closed(sym)
+            return
+
+        # [FIX-15] Real combined stop-loss — fires on the TOTAL position regardless of what
+        # the option price alone says. This catches a stock cratering while its short call is
+        # still short-DTE/cheap, which used to slip through as a false "profit capture" below.
+        if real_stop:
+            state.position_active = False
+            print(f"\n🚨 {sym} COMBINED STOP LOSS: total P&L {combined_pl_pct:.1%} of cost basis "
+                  f"(${combined_pl:,.2f}) <= -{COMBINED_STOP_LOSS_PCT:.0%}. Force-closing the call "
+                  f"— the stock leg is the loss driver here, not the option.")
+            self.trigger_close_covered_call_payload(sym)
+            self.check_global_account_risk()
+            self.maybe_recycle_if_fully_closed(sym)
+            return
+
+        option_says_profit = state.live_option_ask <= state.take_profit_target
+        option_says_stop = state.live_option_ask >= state.stop_loss_target
+
+        if option_says_profit:
+            state.position_active = False
+            if combined_pl >= 0:
+                self.wins += 1
+                print(f"\n💰 {sym} PROFIT CAPTURE ({PROFIT_CAPTURE_PCT:.0%} target): "
+                      f"${state.live_option_ask} <= ${state.take_profit_target} "
+                      f"(combined P&L +${combined_pl:,.2f} confirms it).")
+            else:
+                # The call decayed/is cheap, but the STOCK has dropped enough that the
+                # combined position is actually underwater. Still close the call (no reason
+                # to keep carrying it), but don't count it as a win, and say so plainly.
+                print(f"\n⚠️ {sym} CALL CHEAP BUT POSITION IS DOWN OVERALL: option ${state.live_option_ask} <= "
+                      f"target ${state.take_profit_target}, but combined P&L is ${combined_pl:,.2f} "
+                      f"(the stock leg is underwater more than the call gained). Closing the "
+                      f"call, NOT counting as a win.")
+            self.trigger_close_covered_call_payload(sym)
+            self.check_global_account_risk()
+            self.maybe_recycle_if_fully_closed(sym)
+        elif option_says_stop:
+            if combined_pl >= 0:
+                # The call is expensive because the STOCK rallied hard — the combined
+                # position is actually profitable. Buying back the call at a loss here would
+                # be paying to realize a loss on a winning covered call, so skip the forced
+                # close. The DTE backstop and the combined stop-loss above still apply as normal.
+                print(f"\nℹ️ {sym} CALL EXPENSIVE BUT POSITION IS UP OVERALL: option ${state.live_option_ask} "
+                      f">= stop ${state.stop_loss_target}, but combined P&L is +${combined_pl:,.2f} "
+                      f"(the stock rallied more than the call cost). NOT force-closing.")
+            else:
+                state.position_active = False
+                print(f"\n⚠️ {sym} STOP LOSS: ${state.live_option_ask} >= ${state.stop_loss_target} "
+                      f"(combined P&L ${combined_pl:,.2f} confirms this is a real loss).")
+                self.trigger_close_covered_call_payload(sym)
+                self.check_global_account_risk()
+                self.maybe_recycle_if_fully_closed(sym)
+
+    def recycle_symbol_after_close(self, sym):
+        state = self.symbol_states[sym]
+
+        if any(leg.position_active for leg in state.other_option_legs):
+            return
+
+        if sym in self.liquidation_pending_symbols:
+            note = (
+                f"⏭️ {sym}: recycle_symbol_after_close() called again while a share-liquidation "
+                f"order is already working for this symbol — skipping a duplicate sell. "
+                f"sweep_orphaned_shares() will retry on its own only if that order truly never fills."
+            )
+            print(note)
+            self.write_to_notepad(note)
+            return
+
+        if state.shares_owned > 0:
+            status = self.trigger_liquidate_shares(sym, state.shares_owned)
+            if status == "BLOCKED":
+                # The safety gate said "not yet" (stale snapshot / order already working).
+                # Leave state untouched; the next reconcile pass calls us again once it's safe.
+                return
+            if status == "NONE_HELD":
+                state.shares_owned = 0
+
+        if state.data_reqid is not None:
+            self.cancelMktData(state.data_reqid)
+            self.reqid_to_symbol.pop(state.data_reqid, None)
+            state.data_reqid = None
+
+        state.is_existing_holding = False
+        state.has_executed = False
+        state.opened_by_bot = False
+        state.entry_credit = 0.0
+        state.position_quantity = 0
+        state.take_profit_target = 0.0
+        state.stop_loss_target = 0.0
+        state.entry_days_to_expiry = 0.0
+        state.target_option = None
+        state.chain_contracts = []
+        state.contract_resolved = False
+        state.live_stock_price = 0.0
+        state.live_option_bid = 0.0
+        state.live_option_ask = 0.0
+        state.implied_vol = 0.0
+        state.days_to_expiry = 8.0
+        state.permission_warned = False
+        state.avg_stock_cost = 0.0   # [FIX-15]
+
+        msg = f"♻️ {sym}: position fully closed and RECYCLED — re-scanning for a fresh strike/expiration."
+        print(msg)
+        self.write_to_notepad(msg)
+
+        self.start_chain_lookup(sym)
+
+    def trigger_close_covered_call_payload(self, sym):
+        state = self.symbol_states[sym]
+        if state.position_quantity <= 0 or state.target_option is None:
+            return                      # nothing to close (prevents duplicate buy-to-close flipping to LONG)
+        self.pop_entry_dte(state.target_option.conId)
+
+        buy_to_close = Order()
+        buy_to_close.action = "BUY"
+        buy_to_close.orderType = "MKT"
+        buy_to_close.totalQuantity = state.position_quantity
+        buy_to_close.transmit = True
+        buy_to_close.eTradeOnly = False
+        buy_to_close.firmQuoteOnly = False
+        order_id = self.allocate_order_id()
+        self.order_intents[order_id] = "CLOSE"
+        self.order_symbol[order_id] = sym
+        self.close_orders_pending[order_id] = sym
+        self.placeOrder(order_id, state.target_option, buy_to_close)
+        print(f"🏁 {sym}: buy-to-close submitted.")
+        state.position_quantity = 0
+
+    def monitor_leg_exit_targets(self, sym, leg):
+        live_dte = self.compute_days_to_expiry(leg.contract)
+        dte_floor = leg.entry_days_to_expiry * DTE_BACKSTOP_PCT if leg.entry_days_to_expiry > 0 else 0
+
+        # [FIX-15] Same combined-P&L reasoning as monitor_exit_targets. An extra leg covers
+        # the same underlying shares as the primary leg, so the whole symbol's combined P&L
+        # (not some slice of it) is the right thing to check — there's no separate "stock"
+        # behind just this one leg.
+        state = self.symbol_states[sym]
+        combined_pl = self.combined_position_pl(sym)
+        cost_basis = state.avg_stock_cost * state.shares_owned if state.avg_stock_cost > 0 else 0.0
+        combined_pl_pct = (combined_pl / cost_basis) if cost_basis > 0 else None
+        real_stop = combined_pl_pct is not None and combined_pl_pct <= -COMBINED_STOP_LOSS_PCT
+
+        if leg.entry_days_to_expiry > 0 and live_dte <= dte_floor:
+            leg.position_active = False
+            option_pl = round((leg.entry_credit - leg.live_option_ask) * 100.0 * leg.position_quantity, 2)
+            if combined_pl >= 0:
+                self.wins += 1
+            print(f"\n⏳ {sym} ({leg.contract.localSymbol}) DTE BACKSTOP: {live_dte:.1f} days left <= "
+                  f"{dte_floor:.1f} day floor. Force-closing (leg-only {'+' if option_pl>=0 else ''}${option_pl:,.2f}, "
+                  f"symbol COMBINED {'+' if combined_pl>=0 else ''}${combined_pl:,.2f}).")
+            self.trigger_close_leg_payload(sym, leg)
+            self.check_global_account_risk()
+            self.maybe_recycle_if_fully_closed(sym)
+            return
+
+        if real_stop:
+            leg.position_active = False
+            print(f"\n🚨 {sym} ({leg.contract.localSymbol}) COMBINED STOP LOSS: symbol P&L "
+                  f"{combined_pl_pct:.1%} of cost basis (${combined_pl:,.2f}) <= -{COMBINED_STOP_LOSS_PCT:.0%}.")
+            self.trigger_close_leg_payload(sym, leg)
+            self.check_global_account_risk()
+            self.maybe_recycle_if_fully_closed(sym)
+            return
+
+        option_says_profit = leg.live_option_ask <= leg.take_profit_target
+        option_says_stop = leg.live_option_ask >= leg.stop_loss_target
+
+        if option_says_profit:
+            leg.position_active = False
+            if combined_pl >= 0:
+                self.wins += 1
+                print(f"\n💰 {sym} ({leg.contract.localSymbol}) PROFIT CAPTURE: ${leg.live_option_ask} <= "
+                      f"${leg.take_profit_target} (combined P&L +${combined_pl:,.2f} confirms it).")
+            else:
+                print(f"\n⚠️ {sym} ({leg.contract.localSymbol}) LEG CHEAP BUT SYMBOL IS DOWN OVERALL: "
+                      f"combined P&L ${combined_pl:,.2f}. Closing the leg, NOT counting as a win.")
+            self.trigger_close_leg_payload(sym, leg)
+            self.check_global_account_risk()
+            self.maybe_recycle_if_fully_closed(sym)
+        elif option_says_stop:
+            if combined_pl >= 0:
+                print(f"\nℹ️ {sym} ({leg.contract.localSymbol}) LEG EXPENSIVE BUT SYMBOL IS UP OVERALL: "
+                      f"combined P&L +${combined_pl:,.2f}. NOT force-closing this leg.")
+            else:
+                leg.position_active = False
+                print(f"\n⚠️ {sym} ({leg.contract.localSymbol}) STOP LOSS: ${leg.live_option_ask} >= "
+                      f"${leg.stop_loss_target} (combined P&L ${combined_pl:,.2f} confirms this is a real loss).")
+                self.trigger_close_leg_payload(sym, leg)
+                self.check_global_account_risk()
+                self.maybe_recycle_if_fully_closed(sym)
+
+    def trigger_close_leg_payload(self, sym, leg):
+        if leg.position_quantity <= 0:
+            return
+        self.pop_entry_dte(leg.contract.conId)
+
+        buy_to_close = Order()
+        buy_to_close.action = "BUY"
+        buy_to_close.orderType = "MKT"
+        buy_to_close.totalQuantity = leg.position_quantity
+        buy_to_close.transmit = True
+        buy_to_close.eTradeOnly = False
+        buy_to_close.firmQuoteOnly = False
+        order_id = self.allocate_order_id()
+        self.order_intents[order_id] = "CLOSE_EXTRA_LEG"
+        self.order_symbol[order_id] = sym
+        self.order_leg[order_id] = leg
+        self.close_orders_pending[order_id] = sym
+        self.placeOrder(order_id, leg.contract, buy_to_close)
+        print(f"🏁 {sym} ({leg.contract.localSymbol}): buy-to-close submitted for additional leg.")
+        leg.position_quantity = 0
+
+    # ------------------------------------------------------------------ [FIX-1] THE share-sell gate
+    def _share_order_blocked(self, sym):
+        """Reason string if a new share/combo order on `sym` is unsafe right now, else None."""
+        if not self.shares_position_ready:
+            return "no completed position snapshot yet"
+        if any(s == sym for (s, _a, _q) in self.working_share_orders.values()):
+            return "a share/combo order for this symbol is still working"
+        # [FIX-11] never sell/buy shares while this symbol's call-close order is still working —
+        # that's exactly the naked-call window between "call closed" and "shares sold".
+        if any(oid_sym == sym for oid_sym in self.close_orders_pending.values()):
+            return "a buy-to-close is still working for this symbol"
+        last = self.last_share_activity.get(sym, 0.0)
+        if self._trusted_snapshot_started_at < last + SNAPSHOT_SETTLE_SECONDS:
+            return "no position snapshot taken AFTER the last share order yet (data could be stale)"
+        return None
+
+    def safe_sell_shares(self, sym, requested_shares, reason=""):
+        """The ONLY place a stock SELL may be sent. Returns "SENT", "BLOCKED" or "NONE_HELD"."""
+        why = self._share_order_blocked(sym)
+        if why:
+            self.liquidation_needed_symbols.add(sym)     # let the sweep retry when it's safe
+            msg = f"🛑 {sym}: SELL of {requested_shares} deferred ({reason}) — {why}."
+            print(msg)
+            self.write_to_notepad(msg)
+            return "BLOCKED"
+
+        held = self._trusted_shares.get(sym, 0)
+        qty = min(int(requested_shares), held)
+        if qty <= 0:
+            self.liquidation_needed_symbols.discard(sym)
+            msg = (f"🛑 {sym}: SELL of {requested_shares} refused ({reason}) — broker shows {held} shares held. "
+                   f"Never selling shares that aren't there.")
+            print(msg)
+            self.write_to_notepad(msg)
+            return "NONE_HELD"
+        if qty < int(requested_shares):
+            msg = f"✂️ {sym}: SELL size cut from {requested_shares} to {qty} (all the broker says is held)."
+            print(msg)
+            self.write_to_notepad(msg)
+
+        sell_order = Order()
+        sell_order.action = "SELL"
+        sell_order.orderType = "MKT"
+        sell_order.totalQuantity = qty
+        sell_order.transmit = True
+        sell_order.eTradeOnly = False
+        sell_order.firmQuoteOnly = False
+
+        order_id = self.allocate_order_id()
+        self.order_intents[order_id] = "LIQUIDATE_SHARES"
+        self.order_symbol[order_id] = sym
+        self.working_share_orders[order_id] = (sym, "SELL", qty)
+        self.last_share_activity[sym] = time.time()
+        self.liquidation_needed_symbols.add(sym)
+        self.liquidation_pending_symbols.add(sym)
+        self.placeOrder(order_id, self._stock_contract(sym), sell_order)
+
+        msg = f"🏁 {sym}: share liquidation submitted for {qty} share(s) ({reason})."
+        print(msg)
+        self.write_to_notepad(msg)
+        return "SENT"
+
+    def trigger_liquidate_shares(self, sym, shares):
+        return self.safe_sell_shares(sym, shares, reason="liquidation")
+
+    # ------------------------------------------------------------------ [FIX-5] short-share cover
+    def cover_short_shares(self):
+        """If the broker shows SHORT stock in a tracked symbol, buy it back (market).
+        Runs after every completed position snapshot; never stacks duplicate cover orders."""
+        for sym, short_qty in list(self._trusted_short_shares.items()):
+            if short_qty <= 0:
+                continue
+            if sym not in self.symbol_states:
+                warn = (f"⚠️ {sym}: SHORT {short_qty} share(s) detected but {sym} isn't a tracked symbol — "
+                        f"not touching it automatically. Cover it manually in TWS.")
+                if sym not in self._untracked_call_warned:
+                    self._untracked_call_warned.add(sym)
+                    print(warn)
+                    self.write_to_notepad(warn)
+                continue
+            if not AUTO_COVER_SHORT_SHARES:
+                continue
+            why = self._share_order_blocked(sym)
+            if why:
+                print(f"⏳ {sym}: short {short_qty} sh detected, cover waiting — {why}.")
+                continue
+
+            cover = Order()
+            cover.action = "BUY"
+            cover.orderType = "MKT"
+            cover.totalQuantity = short_qty
+            cover.transmit = True
+            cover.eTradeOnly = False
+            cover.firmQuoteOnly = False
+
+            order_id = self.allocate_order_id()
+            self.order_intents[order_id] = "COVER_SHORT"
+            self.order_symbol[order_id] = sym
+            self.working_share_orders[order_id] = (sym, "BUY", short_qty)
+            self.last_share_activity[sym] = time.time()
+            self.placeOrder(order_id, self._stock_contract(sym), cover)
+
+            msg = f"🚨 {sym}: SHORT {short_qty} share(s) detected (borrowed). Buying them back at market."
+            print(msg)
+            self.write_to_notepad(msg)
+
+    def sweep_orphaned_shares(self):
+        for sym in list(self.liquidation_needed_symbols):
+            actual_shares = self._discovered_shares.get(sym, 0)
+            if actual_shares <= 0:
+                self.liquidation_needed_symbols.discard(sym)
+                if sym in self.symbol_states:
+                    self.symbol_states[sym].shares_owned = 0
+                continue
+            if sym in self.liquidation_pending_symbols:
+                continue
+            if self._share_order_blocked(sym):
+                continue                    # gate isn't open yet; retry on the next snapshot
+            warn = (
+                f"🧹 {sym}: an earlier share-liquidation order apparently never filled — broker "
+                f"still shows {actual_shares} share(s) held with no active call coverage. "
+                f"Resubmitting the sale (a common cause is a plain MKT order placed outside "
+                f"regular trading hours, which IB won't run until the next session)."
+            )
+            print(warn)
+            self.write_to_notepad(warn)
+            self.trigger_liquidate_shares(sym, actual_shares)
+
+    def evaluate_new_position_opportunities(self):
+        if self.system_halted or self.cash_solvency_halt:
+            return
+        if BLOCK_NEW_TRADES_WHILE_SHORT and self._trusted_short_shares:
+            print(f"⛔ New trades blocked: short stock present {self._trusted_short_shares}.")
+            return
+
+        self._cash_earmarked_this_pass = 0.0
+
+        eligible = []
+        for sym, state in self.symbol_states.items():
+            if state.is_existing_holding or state.position_active:
+                continue
+            if not state.contract_resolved or state.stock_conid is None:
+                continue
+            if state.live_option_bid <= 0 or state.live_stock_price <= 0:
+                continue
+
+            vol = state.implied_vol if state.implied_vol > 0 else FALLBACK_VOL
+            theoretical_value = calculate_black_scholes_value(
+                state.live_stock_price, state.target_option.strike, state.days_to_expiry, 0.05, vol
+            )
+            state.bs_edge = state.live_option_bid - theoretical_value
+            state.annualized_yield = (state.live_option_bid / state.live_stock_price) * (365.0 / state.days_to_expiry)
+
+            if state.bs_edge > 0:
+                eligible.append(state)
+
+        eligible.sort(key=lambda s: s.annualized_yield, reverse=True)
+
+        if eligible:
+            summary = ", ".join(f"{s.symbol}({s.category}): {s.annualized_yield:.1%} yield" for s in eligible[:5])
+            print(f"📊 Top ranked buy-write candidates: {summary}")
+
+        candidates_remaining = len(eligible)
+        for state in eligible:
+            self.attempt_new_buy_write(state, candidates_remaining)
+            candidates_remaining -= 1
+
+    def attempt_new_buy_write(self, state, candidates_remaining):
+        if self.cash_solvency_halt:
+            return False
+
+        # [FIX-7] never stack a second buy-write on a symbol that is mid-order or still held
+        sym = state.symbol
+        why = self._share_order_blocked(sym)
+        if why:
+            print(f"⏭️ {sym}: skipping new buy-write — {why}.")
+            return False
+        if self._trusted_shares.get(sym, 0) > 0:
+            print(f"⏭️ {sym}: broker still shows {self._trusted_shares[sym]} share(s) — skipping new buy-write until they're cleared.")
+            return False
+        if any(self.order_symbol.get(oid) == sym for oid in self.combo_leg_fills):
+            return False
+
+        cash_remaining_this_pass = self.available_cash_for_new_trades()
+        if cash_remaining_this_pass <= MIN_CASH_BUFFER:
+            print(f"⏭️ {state.symbol}: no free cash remaining (available ${cash_remaining_this_pass:,.2f}). Skipping.")
+            return False
+
+        allocation = min(cash_remaining_this_pass / max(candidates_remaining, 1), cash_remaining_this_pass)
+
+        # [FIX-10] hard cap on total long stock exposure vs Net Liquidation — no margin borrowing.
+        exposure_cap = self.closing_balance * MAX_LONG_EXPOSURE_PCT
+        room = exposure_cap - self.long_stock_exposure()
+        if room < state.live_stock_price * 100:
+            print(f"⏭️ {state.symbol}: exposure cap reached (long ${self.long_stock_exposure():,.2f} vs cap ${exposure_cap:,.2f}). Skipping.")
+            return False
+        allocation = min(allocation, room)
+
+        shares_affordable = int(allocation // (state.live_stock_price * 100)) * 100
+        if shares_affordable < 100:
+            print(f"⏭️ {state.symbol}: allocation ${allocation:,.2f} not enough for 1 lot at ${state.live_stock_price}. Skipping.")
+            return False
+
+        quantity = shares_affordable // 100
+        trade_cost_estimate = quantity * state.live_stock_price * 100.0
+        alert = (
+            f"💥 NEW BUY-WRITE OPPORTUNITY: {state.symbol} ({state.category}) | "
+            f"Annualized yield: {state.annualized_yield:.1%} | Price: ${state.live_stock_price} | "
+            f"Strike: ${state.target_option.strike} (delta-targeted) | Premium: ${state.live_option_bid} | "
+            f"Sizing: {quantity} lot(s) (est. cost ${trade_cost_estimate:,.2f})"
+        )
+        print(f"\n{alert}")
+        self.write_to_notepad(alert)
+        self.trigger_buy_write_combo(state.symbol, quantity, trade_cost_estimate)
+        self.new_positions_opened_today += 1
+        self._cash_earmarked_this_pass += trade_cost_estimate
+        return True
+
+    def trigger_buy_write_combo(self, sym, quantity, estimated_cost):
+        state = self.symbol_states[sym]
+
+        combo = Contract()
+        combo.symbol = sym
+        combo.secType = "BAG"
+        combo.currency = "USD"
+        combo.exchange = "SMART"
+
+        stock_leg = ComboLeg()
+        stock_leg.conId = state.stock_conid
+        stock_leg.ratio = 100
+        stock_leg.action = "BUY"
+        stock_leg.exchange = "SMART"
+
+        option_leg = ComboLeg()
+        option_leg.conId = state.target_option.conId
+        option_leg.ratio = 1
+        option_leg.action = "SELL"
+        option_leg.exchange = "SMART"
+
+        combo.comboLegs = [stock_leg, option_leg]
+
+        order = Order()
+        order.action = "BUY"
+        order.orderType = "LMT"
+        order.totalQuantity = quantity
+        order.lmtPrice = round(state.live_stock_price - state.live_option_bid, 2)
+        order.transmit = True
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
+
+        order_id = self.allocate_order_id()
+        self.order_intents[order_id] = "OPEN_COMBO"
+        self.order_symbol[order_id] = sym
+        self.combo_leg_fills[order_id] = {
+            "expected_lots": quantity,
+            "stk_shares_filled": 0,
+            "stk_cost_total": 0.0,
+            "opt_contracts_filled": 0,
+            "opt_credit_total": 0.0,
+        }
+        self.pending_order_cash[order_id] = estimated_cost
+        self.working_share_orders[order_id] = (sym, "COMBO", quantity)
+        self.last_share_activity[sym] = time.time()
+        self.placeOrder(order_id, combo, order)
+        self.write_to_notepad(f"ORDER ROUTING: Buy-write combo submitted for {sym}, {quantity} lot(s), net limit ${order.lmtPrice}.")
+
+    def execDetails(self, reqId, contract, execution):
+        if contract.secType == "STK" and contract.symbol:
+            self.last_share_activity[contract.symbol] = time.time()   # any share fill makes older snapshots stale
+
+        order_id = execution.orderId
+        if self.order_intents.get(order_id) != "OPEN_COMBO":
+            return
+        sym = self.order_symbol.get(order_id)
+        state = self.symbol_states.get(sym)
+        if not state or order_id not in self.combo_leg_fills:
+            return
+
+        fills = self.combo_leg_fills[order_id]
+
+        if contract.secType == "STK":
+            shares = int(execution.shares)
+            fills["stk_shares_filled"] += shares
+            fills["stk_cost_total"] += shares * execution.price
+        elif contract.secType == "OPT":
+            contracts = int(execution.shares)
+            fills["opt_contracts_filled"] += contracts
+            fills["opt_credit_total"] += contracts * execution.price
+
+        expected_shares = fills["expected_lots"] * 100
+        expected_contracts = fills["expected_lots"]
+
+        stock_done = fills["stk_shares_filled"] >= expected_shares
+        option_done = fills["opt_contracts_filled"] >= expected_contracts
+
+        if not (stock_done and option_done):
+            print(f"⏳ {sym}: combo partial fill — stock {fills['stk_shares_filled']}/{expected_shares} sh, "
+                  f"option {fills['opt_contracts_filled']}/{expected_contracts} ct.")
+            return
+
+        avg_stock_price = round(fills["stk_cost_total"] / fills["stk_shares_filled"], 4)
+        avg_option_price = round(fills["opt_credit_total"] / fills["opt_contracts_filled"], 4)
+
+        # [FIX-15] Weighted-average the stock cost basis in case this symbol already held
+        # shares (e.g. an existing holding or a prior fill), so combined_position_pl() always
+        # has an accurate basis to compare the live stock price against.
+        prior_shares = state.shares_owned
+        prior_cost = state.avg_stock_cost * prior_shares if state.avg_stock_cost > 0 else 0.0
+        total_shares_after = prior_shares + fills["stk_shares_filled"]
+        if total_shares_after > 0:
+            state.avg_stock_cost = round((prior_cost + fills["stk_cost_total"]) / total_shares_after, 4)
+
+        state.shares_owned += fills["stk_shares_filled"]
+        state.entry_credit = avg_option_price
+        state.position_quantity = fills["stk_shares_filled"] // 100
+        state.position_active = True
+        state.is_existing_holding = True
+        state.opened_by_bot = True
+        state.has_executed = True
+        state.take_profit_target = round(state.entry_credit * self.take_profit_pct, 2)
+        state.stop_loss_target = round(state.entry_credit * self.stop_loss_multiple, 2)
+        state.entry_days_to_expiry = state.days_to_expiry
+        self.record_entry_dte(state.target_option.conId, state.entry_days_to_expiry)
+
+        cost_basis = fills["stk_cost_total"]
+        option_credit_dollars = fills["opt_credit_total"] * 100.0
+        self.committed_capital += cost_basis
+        self.current_cash += (option_credit_dollars - cost_basis)
+        self.total_trades += 1
+
+        msg = (
+            f"🆕 {sym} BUY-WRITE EXECUTED: bought {fills['stk_shares_filled']} shares @ avg ${avg_stock_price}, "
+            f"wrote {state.position_quantity} call(s) @ avg ${avg_option_price} credit. Cost basis ${cost_basis:,.2f}. "
+            f"Entry DTE {state.entry_days_to_expiry:.1f}, saved to ledger."
+        )
+        print(f"\n{msg}")
+        self.write_to_notepad(msg)
+        del self.combo_leg_fills[order_id]
+        self.pending_order_cash.pop(order_id, None)
+        self.enforce_cash_solvency()
+
+    def orderStatus(self, orderId: int, status: str, filled: float, remaining: float, avgFillPrice: float, permId: int, parentId: int, lastFillPrice: float, clientId: int, whyHeld: str, mktCapPrice: float):
+        # [FIX-1] Terminal status is the ONLY thing (besides real errors) that clears a working share order.
+        if status in TERMINAL_ORDER_STATUSES and orderId in self.working_share_orders:
+            w_sym, w_action, w_qty = self.working_share_orders.pop(orderId)
+            self.last_share_activity[w_sym] = time.time()
+            if w_action == "SELL":
+                self.liquidation_pending_symbols.discard(w_sym)
+            self.schedule_snapshot_refresh()
+
+        # [FIX-11] Terminal status also clears a working option buy-to-close.
+        if status in TERMINAL_ORDER_STATUSES and orderId in self.close_orders_pending:
+            self.close_orders_pending.pop(orderId)
+
+        # [FIX-14] Terminal status also clears a working sell-to-open (new-position) order —
+        # covers both a normal fill and our own end-of-day cancellation.
+        if status in TERMINAL_ORDER_STATUSES and orderId in self.open_call_orders_pending:
+            self.open_call_orders_pending.pop(orderId)
+
+        if status in ("Cancelled", "ApiCancelled", "Inactive"):
+            freed = self.pending_order_cash.pop(orderId, None)
+            if freed:
+                note = f"↩️ Released ${freed:,.2f} cash reservation for {status.lower()} order {orderId}."
+                print(note)
+                self.write_to_notepad(note)
+            if self.order_intents.get(orderId) == "LIQUIDATE_SHARES":
+                sym = self.order_symbol.get(orderId)
+                if sym:
+                    self.liquidation_pending_symbols.discard(sym)
+                    note = f"↩️ {sym}: liquidation order {orderId} ended as {status} without filling — the orphan sweep will retry it."
+                    print(note)
+                    self.write_to_notepad(note)
+            return
+        if status != "Filled":
+            return
+        sym = self.order_symbol.get(orderId)
+        intent = self.order_intents.get(orderId)
+        if sym is None or sym not in self.symbol_states:
+            return
+        state = self.symbol_states[sym]
+
+        if intent == "OPEN" and not state.position_active:
+            state.position_active = True
+            state.entry_credit = avgFillPrice
+            state.position_quantity = int(filled)
+            state.take_profit_target = round(state.entry_credit * self.take_profit_pct, 2)
+            state.stop_loss_target = round(state.entry_credit * self.stop_loss_multiple, 2)
+            state.entry_days_to_expiry = state.days_to_expiry
+            if state.target_option is not None:
+                self.record_entry_dte(state.target_option.conId, state.entry_days_to_expiry)
+            self.total_trades += 1
+            fill_msg = f"📦 {sym} COVERED CALL WRITTEN! Qty: {state.position_quantity} | Credit: ${state.entry_credit}"
+            print(f"\n{fill_msg}")
+            self.write_to_notepad(fill_msg)
+        elif intent == "OPEN_COMBO":
+            if remaining == 0:
+                freed = self.pending_order_cash.pop(orderId, None)
+                if freed:
+                    note = (
+                        f"↩️ {sym}: released ${freed:,.2f} cash reservation for combo order {orderId} via "
+                        f"orderStatus's Filled/remaining==0 signal (execDetails never independently tallied "
+                        f"this combo — a known IB reporting gap). If this session isn't tracking the new "
+                        f"short call, the reconcile pass will leave those shares alone; restart to adopt."
+                    )
+                    print(note)
+                    self.write_to_notepad(note)
+        elif intent == "CLOSE":
+            print(f"🏁 {sym}: buy-to-close filled at ${avgFillPrice} for {int(filled)} contract(s).")
+        elif intent == "CLOSE_EXTRA_LEG":
+            leg = self.order_leg.get(orderId)
+            leg_label = leg.contract.localSymbol if leg else sym
+            print(f"🏁 {sym} ({leg_label}): additional-leg buy-to-close filled at ${avgFillPrice} for {int(filled)} contract(s).")
+        elif intent == "COVER_SHORT":
+            msg = f"🏁 {sym}: short-cover BUY filled at ${avgFillPrice} for {int(filled)} share(s)."
+            print(msg)
+            self.write_to_notepad(msg)
+        elif intent == "LIQUIDATE_SHARES":
+            proceeds = round(avgFillPrice * filled, 2)
+            msg = f"🏁 {sym}: share liquidation filled at ${avgFillPrice} for {int(filled)} share(s) (proceeds ${proceeds:,.2f})."
+            print(msg)
+            self.write_to_notepad(msg)
+            state.shares_owned = 0
+            self.liquidation_pending_symbols.discard(sym)
+            self.liquidation_needed_symbols.discard(sym)
+
+    def check_global_account_risk(self):
+        if self.starting_balance <= 0:
+            return
+        current_net_change_pct = (self.closing_balance - self.starting_balance) / self.starting_balance
+        if current_net_change_pct <= -self.max_daily_drawdown_pct:
+            self.system_halted = True
+            print(f"\n🚨 MAXIMUM DRAWDOWN BREACHED ({current_net_change_pct*100:.1f}%). TRADING HALTED.")
+        elif current_net_change_pct >= self.max_daily_markup_pct:
+            self.system_halted = True
+            print(f"\n📈 MAXIMUM DAILY MARKUP REACHED (+{current_net_change_pct*100:.1f}%). LOCKING IN PROFIT.")
+
+    def check_market_clock(self):
+        now = datetime.datetime.now()
+        self.enforce_cash_solvency()
+
+        if now.hour >= 16:
+            self.shutdown_engine()
+            return
+
+        self.heartbeat_count += 1
+        if self.heartbeat_count >= 60:
+            self.heartbeat_count = 0
+            active = [s for s, st in self.symbol_states.items() if st.position_active]
+            netliq_status = f"${self.closing_balance:,.2f}" if self.account_balance_ready else "awaiting..."
+            cash_status = f"${self.current_cash:,.2f}" if self.current_cash else "awaiting..."
+            excess_status = f"${self.excess_liquidity:,.2f}" if self.excess_liquidity_ready else "awaiting..."
+            print(
+                f"💓 [HEARTBEAT {now.strftime('%I:%M %p')}] Net Liq: {netliq_status} | Cash: {cash_status} | "
+                f"Excess Liq: {excess_status} | Committed: ${self.committed_capital:,.2f} | Open: {active} "
+                f"({self.count_active_positions()} symbols) | New today: {self.new_positions_opened_today} | "
+                f"Solvency halt: {self.cash_solvency_halt} | Short stock: {self._trusted_short_shares or 'none'} | "
+                f"Long exposure: ${self.long_stock_exposure():,.2f} | "
+                f"Orphan-sweep watching: {sorted(self.liquidation_needed_symbols)} | "
+                f"Working share orders: {len(self.working_share_orders)} | "
+                f"Pending cash reservations: {len(self.pending_order_cash)} (${sum(self.pending_order_cash.values()):,.2f})"
+            )
+            if self._initial_snapshot_done:
+                self.request_position_snapshot()
+                self.evaluate_new_position_opportunities()
+
+        t = threading.Timer(1.0, self.check_market_clock)
+        t.start()
+
+    def write_to_notepad(self, text_to_log):
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(TRADE_LOG_PATH, "a", encoding="utf-8") as file:
+            file.write(f"[{timestamp}] {text_to_log}\n")
+
+    def cancel_new_position_orders_for_shutdown(self):
+        """[FIX-14] End-of-day cleanup so nothing carries a stale price into the next session.
+        Cancels only NEW-POSITION orders (buy-write combos, sell-to-open calls) that never
+        filled. Never touches a buy-to-close, a share liquidation, or a short-cover order —
+        those are resolving existing risk and must be left to finish, not interrupted."""
+        cancelled = []
+        for order_id in list(self.pending_order_cash.keys()):
+            sym = self.order_symbol.get(order_id, "?")
+            print(f"🌙 EOD cleanup: cancelling unfilled buy-write combo {order_id} ({sym}).")
+            self.cancel_order_safe(order_id)
+            cancelled.append(f"{sym} combo #{order_id}")
+        for order_id in list(self.open_call_orders_pending.keys()):
+            sym = self.order_symbol.get(order_id, "?")
+            print(f"🌙 EOD cleanup: cancelling unfilled sell-to-open call {order_id} ({sym}).")
+            self.cancel_order_safe(order_id)
+            cancelled.append(f"{sym} sell-to-open #{order_id}")
+
+        if cancelled:
+            note = f"🌙 EOD cleanup: cancelled {len(cancelled)} unfilled new-position order(s): {cancelled}."
+            self.write_to_notepad(note)
+            # Give IB a moment to acknowledge the cancels before we disconnect, so the
+            # orderStatus/error callbacks that clear our tracking dicts actually arrive.
+            time.sleep(2)
+        return cancelled
+
+    def cancel_order_safe(self, order_id):
+        try:
+            self.cancelOrder(order_id, "")
+        except TypeError:
+            self.cancelOrder(order_id)
+
+    def shutdown_engine(self):
+        cancelled_orders = self.cancel_new_position_orders_for_shutdown()
+        win_rate = (self.wins / self.total_trades * 100.0) if self.total_trades > 0 else 0.0
+        net_pl_whole_portfolio = round(self.closing_balance - self.starting_balance, 2)
+        cash_change = round(self.current_cash - self.starting_cash, 2)
+        self.append_todays_session()
+
+        lifetime_trades = sum(s["trades"] for s in self.session_history)
+        lifetime_wins = sum(s["wins"] for s in self.session_history)
+        lifetime_win_rate = (lifetime_wins / lifetime_trades * 100.0) if lifetime_trades > 0 else 0.0
+
+        position_lines = self.build_position_snapshot_lines()
+        position_block = "\n".join(position_lines) if position_lines else "   (nothing open — fully in cash)"
+
+        orphan_note = (
+            f"🧹 Symbols still being watched by the orphan-share sweep: {sorted(self.liquidation_needed_symbols)}\n"
+            if self.liquidation_needed_symbols else ""
+        )
+        short_note = (
+            f"🚨 SHORT STOCK STILL OPEN AT SHUTDOWN: {self._trusted_short_shares} — cover it manually in TWS.\n"
+            if self._trusted_short_shares else ""
+        )
+        stale_cash_note = (
+            f"⚠️ {len(self.pending_order_cash)} cash reservation(s) totaling ${sum(self.pending_order_cash.values()):,.2f} "
+            f"still outstanding at shutdown after the cancellation pass — investigate before next session, this "
+            f"means IB hadn't acknowledged a cancel yet when the process exited.\n"
+            if self.pending_order_cash else ""
+        )
+        # [FIX-14]
+        cancelled_note = (
+            f"🌙 Cancelled {len(cancelled_orders)} unfilled new-position order(s) so nothing carries a stale "
+            f"price into the next session: {cancelled_orders}\n"
+            if cancelled_orders else "🌙 No unfilled new-position orders needed cancelling.\n"
+        )
+        still_closing_note = (
+            f"⏳ Still resolving at shutdown (left running on purpose — never interrupt a close): "
+            f"buy-to-close {list(self.close_orders_pending.values())}, "
+            f"share orders {[(s, a) for (s, a, q) in self.working_share_orders.values()]}\n"
+            if (self.close_orders_pending or self.working_share_orders) else ""
+        )
+
+        summary_block = (
+            "\n==================================================\n"
+            "🗒️ --- FINAL END-OF-DAY PORTFOLIO SUMMARY ---\n"
+            f"📅 {datetime.datetime.now().strftime('%Y-%m-%d')}\n"
+            f"📦 Total Trades Today: {self.total_trades} | New Positions Opened: {self.new_positions_opened_today}\n"
+            f"💰 Net Liquidation: ${self.starting_balance:,.2f} -> ${self.closing_balance:,.2f}\n"
+            f"💵 Cash: ${self.starting_cash:,.2f} -> ${self.current_cash:,.2f} ({'+' if cash_change>=0 else ''}${cash_change:,.2f})\n"
+            f"💵 Committed to New Positions: ${self.committed_capital:,.2f}\n"
+            f"🟢 Whole-Portfolio Net P&L Today: {'+' if net_pl_whole_portfolio>=0 else ''}${net_pl_whole_portfolio:,.2f}\n"
+            f"🌟 Today's Win Rate: {win_rate:.1f}% | Lifetime: {lifetime_trades} trades, {lifetime_win_rate:.1f}% win rate\n"
+            f"🔗 Symbols open at close: {self.count_active_positions()}.\n"
+            f"{cancelled_note}"
+            f"{still_closing_note}"
+            f"{short_note}"
+            f"{orphan_note}"
+            f"{stale_cash_note}"
+            f"📋 Portfolio as it stands right now:\n"
+            f"{position_block}\n"
+            "=================================================="
+        )
+        print(summary_block)
+        self.write_to_notepad(summary_block)
+
+        for reqid in list(self.reqid_to_symbol.keys()):
+            self.cancelMktData(reqid)
+        for reqid in list(self.extra_leg_reqid_to_leg.keys()):
+            self.cancelMktData(reqid)
+        self.cancelAccountSummary(self._account_summary_reqid)
+        self.disconnect()
+
+
+def main():
+    engine = BuyWriteBasketEngine()
+    engine.connect("127.0.0.1", 7497, clientId=8157)
+    engine.run()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 Session manually aborted.")
+        sys.exit()
